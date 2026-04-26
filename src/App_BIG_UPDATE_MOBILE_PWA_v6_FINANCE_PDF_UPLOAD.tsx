@@ -474,7 +474,7 @@ const LEAD_STATUS_TRANSITIONS: Record<LeadRecord["status"], LeadRecord["status"]
 const makeId = () => {
   try {
     if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-      return makeId();
+      return crypto.randomUUID();
     }
   } catch {
     // Fallback fuer Safari/iPhone oder unsichere lokale Netzwerk-URLs
@@ -482,6 +482,21 @@ const makeId = () => {
 
   return "local-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10);
 };
+
+const FINANCE_DOCUMENT_BUCKET = "finance-documents";
+
+type FinanceDocument = {
+  transactionId: string;
+  name: string;
+  path: string;
+  createdAt?: string;
+};
+
+const sanitizeFinanceFileName = (name: string) =>
+  name
+    .replace(/[^a-zA-Z0-9.\-_]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "") || "beleg.pdf";
 
 const createEmptyOfferItems = (): OfferItem[] => [
   {
@@ -786,6 +801,9 @@ function App() {
   const [transactionForm, setTransactionForm] = useState<TransactionForm>(() =>
     loadDraft<TransactionForm>("draft_transaction_form", EMPTY_TRANSACTION_FORM)
   );
+  const [transactionReceiptFile, setTransactionReceiptFile] = useState<File | null>(null);
+  const [financeDocuments, setFinanceDocuments] = useState<Record<string, FinanceDocument[]>>({});
+  const [financeStorageMessage, setFinanceStorageMessage] = useState("");
 
   const [templateForm, setTemplateForm] = useState<TemplateForm>(() =>
     loadDraft<TemplateForm>(OFFER_DRAFT_TEMPLATE_FORM_KEY, EMPTY_TEMPLATE_FORM)
@@ -1013,6 +1031,116 @@ function App() {
     };
   }, []);
 
+  const loadFinanceDocuments = useCallback(async (userId: string) => {
+    setFinanceStorageMessage("");
+
+    try {
+      const { data, error } = await supabase.storage
+        .from(FINANCE_DOCUMENT_BUCKET)
+        .list(userId, {
+          limit: 1000,
+          sortBy: { column: "created_at", order: "desc" },
+        });
+
+      if (error) {
+        setFinanceDocuments({});
+        setFinanceStorageMessage(
+          "PDF-Belege sind vorbereitet. Bitte in Supabase Storage einen Bucket finance-documents anlegen und Policies fuer Upload/Lesen aktivieren."
+        );
+        return;
+      }
+
+      const grouped: Record<string, FinanceDocument[]> = {};
+      (data ?? []).forEach((file) => {
+        if (!file.name.toLowerCase().endsWith(".pdf")) return;
+        const parts = file.name.split("__");
+        const transactionId = parts.shift() || "";
+        if (!transactionId) return;
+        const displayName = parts.length > 1 ? parts.slice(1).join("__") : file.name;
+        grouped[transactionId] = [
+          ...(grouped[transactionId] ?? []),
+          {
+            transactionId,
+            name: displayName,
+            path: `${userId}/${file.name}`,
+            createdAt: file.created_at,
+          },
+        ];
+      });
+
+      setFinanceDocuments(grouped);
+    } catch (error) {
+      setFinanceDocuments({});
+      setFinanceStorageMessage(
+        error instanceof Error ? error.message : "PDF-Belege konnten nicht geladen werden."
+      );
+    }
+  }, []);
+
+  const uploadFinanceDocument = useCallback(
+    async (transactionId: string, file: File) => {
+      if (!session?.user?.id) return;
+
+      const isPdf =
+        file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+
+      if (!isPdf) {
+        alert("Bitte nur PDF-Dateien hochladen.");
+        return;
+      }
+
+      if (file.size > 12 * 1024 * 1024) {
+        alert("Die PDF ist zu gross. Bitte maximal 12 MB hochladen.");
+        return;
+      }
+
+      const safeName = sanitizeFinanceFileName(file.name);
+      const path = `${session.user.id}/${transactionId}__${Date.now()}__${safeName}`;
+
+      const { error } = await supabase.storage
+        .from(FINANCE_DOCUMENT_BUCKET)
+        .upload(path, file, {
+          cacheControl: "3600",
+          contentType: "application/pdf",
+          upsert: false,
+        });
+
+      if (error) {
+        setFinanceStorageMessage(
+          "PDF konnte nicht hochgeladen werden. Bitte pruefe den Supabase Storage Bucket finance-documents und die Policies."
+        );
+        throw error;
+      }
+
+      await loadFinanceDocuments(session.user.id);
+    },
+    [loadFinanceDocuments, session]
+  );
+
+  const openFinanceDocument = async (document: FinanceDocument) => {
+    const { data, error } = await supabase.storage
+      .from(FINANCE_DOCUMENT_BUCKET)
+      .createSignedUrl(document.path, 60 * 10);
+
+    if (error || !data?.signedUrl) {
+      alert(error?.message ?? "PDF konnte nicht geoeffnet werden.");
+      return;
+    }
+
+    window.open(data.signedUrl, "_blank", "noopener,noreferrer");
+  };
+
+  const handleExistingTransactionPdfUpload = async (transactionId: string, file?: File | null) => {
+    if (!file) return;
+
+    try {
+      await uploadFinanceDocument(transactionId, file);
+      alert("PDF-Beleg wurde hochgeladen.");
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "PDF konnte nicht hochgeladen werden.");
+    }
+  };
+
   const reloadAll = useCallback(async () => {
     if (!session?.user?.id) return;
 
@@ -1076,6 +1204,7 @@ function App() {
           normalizeTransaction(item as Transaction)
         )
       );
+      await loadFinanceDocuments(userId);
       setServiceTemplates(
         (templatesRes.data ?? []).map((item) =>
           normalizeTemplate(item as ServiceTemplate)
@@ -1087,7 +1216,7 @@ function App() {
     } finally {
       setLoadingData(false);
     }
-  }, [session]);
+  }, [loadFinanceDocuments, session]);
 
   const applyOfferDraftPayload = useCallback((payload: OfferDraftPayload) => {
     setCurrentDraftOfferId(payload.draftOfferId ?? null);
@@ -1671,6 +1800,7 @@ function App() {
       date: getTodayDate(),
     };
     setTransactionForm(resetValue);
+    setTransactionReceiptFile(null);
     clearDraft("draft_transaction_form");
   };
 
@@ -2557,7 +2687,10 @@ function App() {
     }
 
     try {
+      const transactionId = makeId();
+
       const { error } = await supabase.from("transactions").insert({
+        id: transactionId,
         user_id: session.user.id,
         type: transactionForm.type,
         title,
@@ -2567,6 +2700,10 @@ function App() {
       });
 
       if (error) throw error;
+
+      if (transactionReceiptFile) {
+        await uploadFinanceDocument(transactionId, transactionReceiptFile);
+      }
 
       resetTransactionForm();
       await reloadAll();
@@ -5516,6 +5653,30 @@ const printDocumentBase = ({
             </div>
           </div>
 
+          <div style={styles.mutedBox}>
+            <strong>PDF-Beleg optional</strong>
+            <div style={{ marginTop: "8px", color: "#4b5563", lineHeight: 1.5 }}>
+              Lade z. B. Quittungen, Eingangsrechnungen oder Zahlungsnachweise als PDF hoch.
+            </div>
+            <input
+              type="file"
+              accept="application/pdf,.pdf"
+              onChange={(e) => setTransactionReceiptFile(e.currentTarget.files?.[0] ?? null)}
+              style={{ ...styles.input, marginTop: "10px", padding: "12px" }}
+            />
+            {transactionReceiptFile ? (
+              <div style={{ marginTop: "8px", fontSize: "14px", color: "#334155" }}>
+                Ausgewaehlt: <strong>{transactionReceiptFile.name}</strong>
+              </div>
+            ) : null}
+          </div>
+
+          {financeStorageMessage ? (
+            <div style={{ ...styles.mutedBox, borderColor: "#f59e0b", color: "#92400e" }}>
+              {financeStorageMessage}
+            </div>
+          ) : null}
+
           <div style={styles.row}>
             <ActionButton onClick={addManualTransaction} style={styles.buttonPrimary}>
               Buchung speichern
@@ -5591,6 +5752,46 @@ const printDocumentBase = ({
                       </div>
                       <div style={{ marginTop: "8px" }}>
                         <span style={styles.badgeOpen}>Ausgabe</span>
+                      </div>
+
+                      <div style={{ marginTop: "12px", display: "grid", gap: "8px" }}>
+                        {(financeDocuments[transaction.id] ?? []).length > 0 ? (
+                          (financeDocuments[transaction.id] ?? []).map((document) => (
+                            <button
+                              key={document.path}
+                              type="button"
+                              onClick={() => openFinanceDocument(document)}
+                              style={{
+                                border: "1px solid #dbe3ef",
+                                background: "#f8fafc",
+                                borderRadius: "12px",
+                                padding: "10px 12px",
+                                textAlign: "left",
+                                color: "#1e293b",
+                                fontWeight: 700,
+                                cursor: "pointer",
+                              }}
+                            >
+                              PDF oeffnen · {document.name}
+                            </button>
+                          ))
+                        ) : (
+                          <span style={{ color: "#64748b", fontSize: "14px" }}>Noch kein PDF-Beleg hinterlegt.</span>
+                        )}
+
+                        <label style={{ ...styles.buttonSecondary, display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+                          PDF hochladen
+                          <input
+                            type="file"
+                            accept="application/pdf,.pdf"
+                            style={{ display: "none" }}
+                            onChange={(event) => {
+                              const file = event.currentTarget.files?.[0];
+                              event.currentTarget.value = "";
+                              handleExistingTransactionPdfUpload(transaction.id, file);
+                            }}
+                          />
+                        </label>
                       </div>
                     </div>
 
