@@ -1,0 +1,4 @@
+// In src/main.tsx ergänzen:
+import { registerServiceWorker } from "./pwa-register";
+
+registerServiceWorker();
