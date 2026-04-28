@@ -169,7 +169,7 @@ const COMPANY_PROFILE = {
   website: "",
 };
 
-type TabKey = "dashboard" | "customers" | "properties" | "offers" | "operations" | "invoices" | "finance" | "leads";
+type TabKey = "dashboard" | "customers" | "properties" | "offers" | "operations" | "invoices" | "finance" | "leads" | "team";
 
 type Customer = {
   id: string;
@@ -288,6 +288,7 @@ type PropertyRecord = {
 
 type JobRecord = {
   id: string;
+  user_id?: string;
   property_id: string;
   customer_id: string;
   source_offer_id?: string | null;
@@ -299,6 +300,8 @@ type JobRecord = {
   scheduled_for: string;
   recurrence: "once" | "weekly" | "monthly" | "after_checkout";
   assignee: string;
+  assigned_user_id?: string | null;
+  organization_id?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -306,9 +309,19 @@ type JobRecord = {
 type JobUpdateRecord = {
   id: string;
   job_id: string;
+  user_id?: string;
   kind: "note" | "visit" | "issue" | "done";
   note: string;
   photo_urls: string[];
+  created_at: string;
+};
+
+type TeamInviteRecord = {
+  id: string;
+  email: string;
+  role: string;
+  invited_by?: string | null;
+  accepted_at?: string | null;
   created_at: string;
 };
 
@@ -348,6 +361,7 @@ type JobForm = {
   scheduledFor: string;
   recurrence: JobRecord["recurrence"];
   assignee: string;
+  assignedUserId: string;
 };
 
 type JobUpdateForm = {
@@ -433,6 +447,7 @@ const EMPTY_JOB_FORM: JobForm = {
   scheduledFor: getTodayDate(),
   recurrence: "once",
   assignee: "",
+  assignedUserId: "",
 };
 
 const EMPTY_JOB_UPDATE_FORM: JobUpdateForm = {
@@ -589,6 +604,7 @@ function normalizeJobRecord(input: Partial<JobRecord>): JobRecord {
   const now = new Date().toISOString();
   return {
     id: input.id ?? makeId(),
+    user_id: input.user_id ?? "",
     property_id: input.property_id ?? "",
     customer_id: input.customer_id ?? "",
     source_offer_id: input.source_offer_id ?? null,
@@ -600,6 +616,8 @@ function normalizeJobRecord(input: Partial<JobRecord>): JobRecord {
     scheduled_for: input.scheduled_for ?? getTodayDate(),
     recurrence: (input.recurrence as JobRecord["recurrence"]) ?? "once",
     assignee: input.assignee ?? "",
+    assigned_user_id: input.assigned_user_id ?? null,
+    organization_id: input.organization_id ?? null,
     created_at: input.created_at ?? now,
     updated_at: input.updated_at ?? input.created_at ?? now,
   };
@@ -609,6 +627,7 @@ function normalizeJobUpdateRecord(input: Partial<JobUpdateRecord>): JobUpdateRec
   const now = new Date().toISOString();
   return {
     id: input.id ?? makeId(),
+    user_id: input.user_id ?? "",
     job_id: input.job_id ?? "",
     kind: (input.kind as JobUpdateRecord["kind"]) ?? "note",
     note: input.note ?? "",
@@ -856,6 +875,14 @@ function App() {
   const [leadDeleteTarget, setLeadDeleteTarget] = useState<LeadRecord | null>(null);
   const [leadDeleteBusy, setLeadDeleteBusy] = useState(false);
 
+  const [teamMembers, setTeamMembers] = useState<any[]>([]);
+  const [teamLoading, setTeamLoading] = useState(false);
+  const [teamMessage, setTeamMessage] = useState("");
+  const [teamNewUserId, setTeamNewUserId] = useState("");
+  const [teamInviteEmail, setTeamInviteEmail] = useState("");
+  const [teamInvites, setTeamInvites] = useState<TeamInviteRecord[]>([]);
+  const [teamNewRole, setTeamNewRole] = useState("field_worker");
+
   const buildBackupSnapshot = useCallback(
     (source: "auto" | "manual" = "auto"): BackupSnapshot => ({
       id: makeId(),
@@ -1014,19 +1041,36 @@ function App() {
   ]);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
-      setAuthReady(true);
-    });
+    let isMounted = true;
+
+    supabase.auth
+      .getSession()
+      .then(({ data }) => {
+        if (!isMounted) return;
+        setSession(data.session);
+        setAuthReady(true);
+      })
+      .catch((error) => {
+        console.error("Supabase Auth konnte nicht geladen werden:", error);
+        if (!isMounted) return;
+        setSession(null);
+        setAuthError(
+          "Supabase ist gerade nicht erreichbar. Bitte Internet/VPN prüfen und danach neu laden."
+        );
+        setAuthReady(true);
+        setLoadingData(false);
+      });
 
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (!isMounted) return;
       setSession(nextSession);
       setAuthReady(true);
     });
 
     return () => {
+      isMounted = false;
       subscription.unsubscribe();
     };
   }, []);
@@ -1076,6 +1120,139 @@ function App() {
       );
     }
   }, []);
+
+  const loadTeamMembers = useCallback(async () => {
+    if (!session?.user?.id) return;
+
+    setTeamLoading(true);
+    setTeamMessage("");
+
+    try {
+      const { data, error } = await supabase
+        .from("user_roles")
+        .select("id,user_id,role,email,created_at")
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+      setTeamMembers(data ?? []);
+
+      const { data: inviteData, error: inviteError } = await supabase
+        .from("team_invites")
+        .select("id,email,role,invited_by,accepted_at,created_at")
+        .is("accepted_at", null)
+        .order("created_at", { ascending: false });
+
+      if (!inviteError) {
+        setTeamInvites((inviteData ?? []) as TeamInviteRecord[]);
+      }
+    } catch (error) {
+      setTeamMembers([]);
+      setTeamMessage(
+        "Teamdaten konnten nicht geladen werden. Bitte pruefe die Tabelle user_roles und die RLS-Policies."
+      );
+    } finally {
+      setTeamLoading(false);
+    }
+  }, [session?.user?.id]);
+
+  useEffect(() => {
+    if (authReady && session?.user?.id) {
+      loadTeamMembers();
+    }
+  }, [authReady, loadTeamMembers, session?.user?.id]);
+
+  const currentUserRole = useMemo(() => {
+    const ownRole = teamMembers.find((member) => member.user_id === session?.user?.id)?.role;
+    return ownRole || "owner";
+  }, [session?.user?.id, teamMembers]);
+
+  const canManageTeam = currentUserRole === "owner" || currentUserRole === "admin";
+
+  const upsertTeamMember = useCallback(async () => {
+    const userId = teamNewUserId.trim();
+    if (!userId) {
+      setTeamMessage("Bitte eine User-ID eintragen.");
+      return;
+    }
+
+    setTeamLoading(true);
+    setTeamMessage("");
+
+    try {
+      const { error } = await supabase
+        .from("user_roles")
+        .upsert(
+          { user_id: userId, role: teamNewRole },
+          { onConflict: "user_id" }
+        );
+
+      if (error) throw error;
+
+      setTeamNewUserId("");
+      setTeamMessage("Mitarbeiter/Rolle wurde gespeichert.");
+      await loadTeamMembers();
+    } catch (error) {
+      setTeamMessage(error instanceof Error ? error.message : "Rolle konnte nicht gespeichert werden.");
+    } finally {
+      setTeamLoading(false);
+    }
+  }, [loadTeamMembers, teamNewRole, teamNewUserId]);
+
+  const inviteTeamMemberByEmail = useCallback(async () => {
+    const email = teamInviteEmail.trim().toLowerCase();
+    if (!email || !email.includes("@")) {
+      setTeamMessage("Bitte eine gültige E-Mail-Adresse eintragen.");
+      return;
+    }
+
+    setTeamLoading(true);
+    setTeamMessage("");
+
+    try {
+      const { error } = await supabase
+        .from("team_invites")
+        .upsert(
+          {
+            email,
+            role: teamNewRole,
+            invited_by: session?.user?.id ?? null,
+            accepted_at: null,
+          },
+          { onConflict: "email" }
+        );
+
+      if (error) throw error;
+
+      setTeamInviteEmail("");
+      setTeamMessage("Einladung gespeichert. Sobald sich der Mitarbeiter mit dieser E-Mail registriert, wird die Rolle automatisch gesetzt.");
+      await loadTeamMembers();
+    } catch (error) {
+      setTeamMessage(error instanceof Error ? error.message : "Einladung konnte nicht gespeichert werden.");
+    } finally {
+      setTeamLoading(false);
+    }
+  }, [loadTeamMembers, session?.user?.id, teamInviteEmail, teamNewRole]);
+
+  const updateTeamMemberRole = useCallback(async (userId: string, role: string) => {
+    setTeamLoading(true);
+    setTeamMessage("");
+
+    try {
+      const { error } = await supabase
+        .from("user_roles")
+        .update({ role })
+        .eq("user_id", userId);
+
+      if (error) throw error;
+      await loadTeamMembers();
+      setTeamMessage("Rolle wurde aktualisiert.");
+    } catch (error) {
+      setTeamMessage(error instanceof Error ? error.message : "Rolle konnte nicht aktualisiert werden.");
+    } finally {
+      setTeamLoading(false);
+    }
+  }, [loadTeamMembers]);
+
 
   const uploadFinanceDocument = useCallback(
     async (transactionId: string, file: File) => {
@@ -1142,7 +1319,16 @@ function App() {
   };
 
   const reloadAll = useCallback(async () => {
-    if (!session?.user?.id) return;
+    if (!session?.user?.id) {
+      setLoadingData(false);
+      return;
+    }
+
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+      setAppError("Keine Internetverbindung. Lokale Daten bleiben sichtbar, sobald vorhanden.");
+      setLoadingData(false);
+      return;
+    }
 
     setLoadingData(true);
     setAppError("");
@@ -1150,7 +1336,7 @@ function App() {
     try {
       const userId = session.user.id;
 
-      const [customersRes, offersRes, invoicesRes, transactionsRes, templatesRes, leadsRes] =
+      const [customersRes, offersRes, invoicesRes, transactionsRes, templatesRes, leadsRes, jobsRes, jobUpdatesRes] =
         await Promise.all([
           supabase
             .from("customers")
@@ -1187,6 +1373,17 @@ function App() {
             .from("leads")
             .select("*")
             .order("created_at", { ascending: false }),
+
+          supabase
+            .from("jobs")
+            .select("*")
+            .order("scheduled_for", { ascending: true })
+            .order("created_at", { ascending: false }),
+
+          supabase
+            .from("job_updates")
+            .select("*")
+            .order("created_at", { ascending: false }),
         ]);
 
       if (customersRes.error) throw customersRes.error;
@@ -1195,6 +1392,8 @@ function App() {
       if (transactionsRes.error) throw transactionsRes.error;
       if (templatesRes.error) throw templatesRes.error;
       if (leadsRes.error) throw leadsRes.error;
+      if (jobsRes.error) throw jobsRes.error;
+      if (jobUpdatesRes.error) throw jobUpdatesRes.error;
 
       setCustomers(customersRes.data ?? []);
       setOffers((offersRes.data ?? []).map((item) => normalizeOffer(item as Offer)));
@@ -1211,13 +1410,49 @@ function App() {
         )
       );
       setLeads((leadsRes.data ?? []).map((item) => normalizeLeadRecord(item as Partial<LeadRecord>)));
+      setJobs((jobsRes.data ?? []).map((item) => normalizeJobRecord(item as Partial<JobRecord>)));
+      setJobUpdates((jobUpdatesRes.data ?? []).map((item) => normalizeJobUpdateRecord(item as Partial<JobUpdateRecord>)));
     } catch (error) {
-      setAppError(error instanceof Error ? error.message : "Daten konnten nicht geladen werden.");
+      console.error("Daten konnten nicht geladen werden:", error);
+      const message = error instanceof Error ? error.message : "Daten konnten nicht geladen werden.";
+      const looksLikeNetworkError =
+        message.toLowerCase().includes("failed to fetch") ||
+        message.toLowerCase().includes("network") ||
+        message.toLowerCase().includes("internet") ||
+        message.toLowerCase().includes("fetch");
+
+      setAppError(
+        looksLikeNetworkError
+          ? "Supabase ist gerade nicht erreichbar. Bitte Internet/VPN prüfen. Die App bleibt geöffnet und lokale Daten bleiben erhalten."
+          : message
+      );
     } finally {
       setLoadingData(false);
     }
   }, [loadFinanceDocuments, session]);
 
+  const assignJobToUser = useCallback(async (jobId: string, userId: string) => {
+    const now = new Date().toISOString();
+    const assignedUserId = userId || null;
+
+    setJobs((currentJobs) =>
+      currentJobs.map((job) =>
+        job.id === jobId
+          ? { ...job, assigned_user_id: assignedUserId, updated_at: now }
+          : job
+      )
+    );
+
+    const { error } = await supabase
+      .from("jobs")
+      .update({ assigned_user_id: assignedUserId, updated_at: now })
+      .eq("id", jobId);
+
+    if (error) {
+      setAppError(error.message);
+      await reloadAll();
+    }
+  }, [reloadAll]);
   const applyOfferDraftPayload = useCallback((payload: OfferDraftPayload) => {
     setCurrentDraftOfferId(payload.draftOfferId ?? null);
     setSelectedCustomerId(payload.selectedCustomerId ?? "");
@@ -1236,6 +1471,8 @@ function App() {
       setInvoices([]);
       setTransactions([]);
       setServiceTemplates([]);
+      setJobs([]);
+      setJobUpdates([]);
       setLoadingData(false);
     }
   }, [session, reloadAll]);
@@ -1875,7 +2112,12 @@ function App() {
     }
   };
 
-  const saveJob = () => {
+  const saveJob = async () => {
+    if (!session?.user?.id) {
+      window.alert("Bitte zuerst einloggen.");
+      return;
+    }
+
     if (!jobForm.propertyId) {
       window.alert("Bitte zuerst ein Objekt auswählen.");
       return;
@@ -1890,6 +2132,7 @@ function App() {
     const now = new Date().toISOString();
     const nextJob: JobRecord = {
       id: makeId(),
+      user_id: session.user.id,
       property_id: jobForm.propertyId,
       customer_id: jobForm.customerId,
       source_offer_id: null,
@@ -1901,43 +2144,72 @@ function App() {
       scheduled_for: jobForm.scheduledFor || getTodayDate(),
       recurrence: jobForm.recurrence,
       assignee: jobForm.assignee.trim(),
+      assigned_user_id: jobForm.assignedUserId || null,
       created_at: now,
       updated_at: now,
     };
 
-    setJobs((prev) => [nextJob, ...prev]);
+    const { data, error } = await supabase.from("jobs").insert(nextJob).select("*").single();
+    if (error) {
+      setAppError(error.message);
+      window.alert("Auftrag konnte nicht gespeichert werden: " + error.message);
+      return;
+    }
+
+    setJobs((prev) => [normalizeJobRecord(data as Partial<JobRecord>), ...prev]);
     resetJobForm();
   };
 
-  const updateJobStatus = (jobId: string, status: JobRecord["status"]) => {
+  const updateJobStatus = async (jobId: string, status: JobRecord["status"]) => {
     const now = new Date().toISOString();
-    setJobs((prev) => prev.map((job) => {
-      if (job.id !== jobId) return job;
-      if (status !== "done") return { ...job, status, updated_at: now };
-      const nextScheduledFor = job.recurrence === "weekly"
-        ? addDays(job.scheduled_for, 7)
-        : job.recurrence === "monthly"
-          ? addDays(job.scheduled_for, 30)
-          : job.recurrence === "after_checkout"
-            ? addDays(job.scheduled_for, 3)
-            : job.scheduled_for;
-      return {
-        ...job,
-        status,
-        scheduled_for: job.recurrence === "once" ? job.scheduled_for : nextScheduledFor,
-        updated_at: now,
-      };
-    }));
+    const currentJob = jobs.find((job) => job.id === jobId);
+    if (!currentJob) return;
+
+    const scheduledFor = status === "done" && currentJob.recurrence !== "once"
+      ? currentJob.recurrence === "weekly"
+        ? addDays(currentJob.scheduled_for, 7)
+        : currentJob.recurrence === "monthly"
+          ? addDays(currentJob.scheduled_for, 30)
+          : currentJob.recurrence === "after_checkout"
+            ? addDays(currentJob.scheduled_for, 3)
+            : currentJob.scheduled_for
+      : currentJob.scheduled_for;
+
+    const nextJob = { ...currentJob, status, scheduled_for: scheduledFor, updated_at: now };
+    setJobs((prev) => prev.map((job) => (job.id === jobId ? nextJob : job)));
+
+    const { error } = await supabase
+      .from("jobs")
+      .update({ status, scheduled_for: scheduledFor, updated_at: now })
+      .eq("id", jobId);
+
+    if (error) {
+      setAppError(error.message);
+      await reloadAll();
+    }
   };
 
-  const deleteJob = (jobId: string) => {
+  const deleteJob = async (jobId: string) => {
     const confirmed = window.confirm("Diesen Auftrag wirklich löschen?");
     if (!confirmed) return;
+
+    const { error } = await supabase.from("jobs").delete().eq("id", jobId);
+    if (error) {
+      setAppError(error.message);
+      window.alert("Auftrag konnte nicht gelöscht werden: " + error.message);
+      return;
+    }
+
     setJobs((prev) => prev.filter((job) => job.id !== jobId));
     setJobUpdates((prev) => prev.filter((update) => update.job_id !== jobId));
   };
 
-  const saveJobUpdate = () => {
+  const saveJobUpdate = async () => {
+    if (!session?.user?.id) {
+      window.alert("Bitte zuerst einloggen.");
+      return;
+    }
+
     if (!jobUpdateForm.jobId) {
       window.alert("Bitte zuerst einen Auftrag auswählen.");
       return;
@@ -1953,6 +2225,7 @@ function App() {
     const nextUpdate: JobUpdateRecord = {
       id: makeId(),
       job_id: jobUpdateForm.jobId,
+      user_id: session.user.id,
       kind: jobUpdateForm.kind,
       note,
       photo_urls: [
@@ -1965,9 +2238,16 @@ function App() {
       created_at: now,
     };
 
-    setJobUpdates((prev) => [nextUpdate, ...prev]);
+    const { data, error } = await supabase.from("job_updates").insert(nextUpdate).select("*").single();
+    if (error) {
+      setAppError(error.message);
+      window.alert("Update konnte nicht gespeichert werden: " + error.message);
+      return;
+    }
+
+    setJobUpdates((prev) => [normalizeJobUpdateRecord(data as Partial<JobUpdateRecord>), ...prev]);
     if (jobUpdateForm.kind === "done") {
-      updateJobStatus(jobUpdateForm.jobId, "done");
+      await updateJobStatus(jobUpdateForm.jobId, "done");
     }
     resetJobUpdateForm();
   };
@@ -5007,9 +5287,20 @@ const printDocumentBase = ({
               </select>
             </div>
           </div>
-          <div>
-            <label style={styles.smallLabel}>Verantwortlich / Dienstleister</label>
-            <input value={jobForm.assignee} onChange={(e) => handleJobFormChange("assignee", e.target.value)} placeholder="z. B. intern, Reinigungsteam, Hausmeister" style={styles.input} />
+          <div style={styles.row}>
+            <div style={{ flex: 1 }}>
+              <label style={styles.smallLabel}>Verantwortlich / Dienstleister</label>
+              <input value={jobForm.assignee} onChange={(e) => handleJobFormChange("assignee", e.target.value)} placeholder="z. B. intern, Reinigungsteam, Hausmeister" style={styles.input} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={styles.smallLabel}>Mitarbeiter zuweisen</label>
+              <select value={jobForm.assignedUserId} onChange={(e) => handleJobFormChange("assignedUserId", e.target.value)} style={styles.input}>
+                <option value="">Noch nicht zuweisen</option>
+                {teamMembers.filter((member) => ["field_worker", "admin", "owner"].includes(member.role)).map((member) => (
+                  <option key={member.user_id} value={member.user_id}>{member.email || member.user_id}</option>
+                ))}
+              </select>
+            </div>
           </div>
           <div style={styles.row}>
             <ActionButton onClick={saveJob} style={styles.buttonPrimary}>Auftrag speichern</ActionButton>
@@ -5080,7 +5371,7 @@ const printDocumentBase = ({
                   <div style={styles.entityHeader}>
                     <div>
                       <h3 style={{ margin: "0 0 6px 0", fontSize: "20px" }}>{job.title}</h3>
-                      <div style={{ color: "#4b5563", fontSize: "14px" }}>{getPropertyDisplayName(job.property_id)} · {formatDateGerman(job.scheduled_for)}</div>
+                      <div style={{ color: "#4b5563", fontSize: "14px" }}>{getPropertyDisplayName(job.property_id)} · {formatDateGerman(job.scheduled_for)}{job.assigned_user_id ? ` · zugewiesen: ${teamMembers.find((member) => member.user_id === job.assigned_user_id)?.email || job.assigned_user_id}` : ""}</div>
                       <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "10px" }}>
                         <span style={job.status === "done" ? styles.badgePaid : job.priority === "high" ? styles.badgeOpen : styles.badgeNeutral}>{getJobStatusLabel(job.status)}</span>
                         <span style={styles.badgeNeutral}>{getPriorityLabel(job.priority)}</span>
@@ -5553,6 +5844,173 @@ const printDocumentBase = ({
       )}
     </section>
   );
+
+  const renderTeam = () => {
+    const roles = ["owner", "admin", "office", "field_worker", "viewer"];
+    const fieldWorkers = teamMembers.filter((member) => member.role === "field_worker");
+
+    return (
+      <section style={styles.card}>
+        <h2 style={styles.cardTitle}>Team & Rollen</h2>
+        <p style={styles.mutedText}>
+          Verwalte Mitarbeiterrollen und weise Einsätze an Field Worker zu.
+        </p>
+
+        <div style={{ ...styles.infoBox, marginBottom: 16 }}>
+          Deine aktuelle Rolle: <strong>{currentUserRole}</strong>
+        </div>
+
+        {teamMessage && (
+          <div style={{ ...styles.infoBox, marginBottom: 16 }}>
+            {teamMessage}
+          </div>
+        )}
+
+        {canManageTeam ? (
+          <>
+            <div style={styles.formGrid}>
+              <label style={styles.label}>
+                Mitarbeiter per E-Mail einladen
+                <input
+                  value={teamInviteEmail}
+                  onChange={(event) => setTeamInviteEmail(event.target.value)}
+                  placeholder="name@firma.de"
+                  inputMode="email"
+                  autoCapitalize="none"
+                  style={styles.input}
+                />
+              </label>
+
+              <label style={styles.label}>
+                Rolle
+                <select
+                  value={teamNewRole}
+                  onChange={(event) => setTeamNewRole(event.target.value)}
+                  style={styles.input}
+                >
+                  {roles.map((role) => (
+                    <option key={role} value={role}>{role}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div style={styles.row}>
+              <ActionButton
+                onClick={inviteTeamMemberByEmail}
+                style={styles.buttonPrimary}
+                disabled={teamLoading}
+              >
+                Einladung speichern
+              </ActionButton>
+            </div>
+
+            <div style={{ ...styles.mutedBox, marginTop: 14 }}>
+              <strong>Fallback für bestehende Accounts</strong>
+              <div style={{ marginTop: 8 }}>Falls ein Mitarbeiter schon registriert ist, kannst du weiterhin direkt seine Supabase User-ID setzen.</div>
+              <div style={{ ...styles.formGrid, marginTop: 12 }}>
+                <input
+                  value={teamNewUserId}
+                  onChange={(event) => setTeamNewUserId(event.target.value)}
+                  placeholder="auth.users UUID einfügen"
+                  style={styles.input}
+                />
+                <ActionButton
+                  onClick={upsertTeamMember}
+                  style={styles.buttonSecondary}
+                  disabled={teamLoading}
+                >
+                  User-ID speichern
+                </ActionButton>
+              </div>
+            </div>
+
+            <div style={{ height: 20 }} />
+
+            <h3 style={styles.sectionTitle}>Mitarbeiter</h3>
+            {teamLoading ? (
+              <p style={styles.mutedText}>Team wird geladen...</p>
+            ) : teamMembers.length === 0 ? (
+              <p style={styles.mutedText}>Noch keine Rollen gespeichert.</p>
+            ) : (
+              <div style={styles.list}>
+                {teamMembers.map((member) => (
+                  <div key={member.user_id} style={styles.listItem}>
+                    <div>
+                      <strong>{member.email || member.user_id}</strong>
+                      <div style={styles.mutedText}>{member.email ? member.user_id : ""}</div>
+                      <div style={styles.mutedText}>seit {formatDateGerman(member.created_at)}</div>
+                    </div>
+                    <select
+                      value={member.role}
+                      onChange={(event) => updateTeamMemberRole(member.user_id, event.target.value)}
+                      style={{ ...styles.input, maxWidth: 220 }}
+                    >
+                      {roles.map((role) => (
+                        <option key={role} value={role}>{role}</option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div style={{ height: 28 }} />
+
+            <h3 style={styles.sectionTitle}>Offene Einladungen</h3>
+            {teamInvites.length === 0 ? (
+              <p style={styles.mutedText}>Keine offenen Einladungen.</p>
+            ) : (
+              <div style={styles.list}>
+                {teamInvites.map((invite) => (
+                  <div key={invite.id} style={styles.listItem}>
+                    <div>
+                      <strong>{invite.email}</strong>
+                      <div style={styles.mutedText}>Rolle: {invite.role} · seit {formatDateGerman(invite.created_at)}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div style={{ height: 28 }} />
+
+            <h3 style={styles.sectionTitle}>Einsätze zuweisen</h3>
+            {jobs.length === 0 ? (
+              <p style={styles.mutedText}>Noch keine Einsätze vorhanden.</p>
+            ) : (
+              <div style={styles.list}>
+                {jobs.map((job) => (
+                  <div key={job.id} style={styles.listItem}>
+                    <div>
+                      <strong>{job.title}</strong>
+                      <div style={styles.mutedText}>
+                        {job.scheduled_for ? formatDateGerman(job.scheduled_for) : "kein Datum"} · Status: {job.status}
+                      </div>
+                    </div>
+                    <select
+                      value={job.assigned_user_id || ""}
+                      onChange={(event) => assignJobToUser(job.id, event.target.value)}
+                      style={{ ...styles.input, maxWidth: 260 }}
+                    >
+                      <option value="">Nicht zugewiesen</option>
+                      {fieldWorkers.map((member) => (
+                        <option key={member.user_id} value={member.user_id}>
+                          {member.email || member.user_id}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        ) : (
+          <p style={styles.mutedText}>Du hast keine Berechtigung für die Teamverwaltung.</p>
+        )}
+      </section>
+    );
+  };
 
   const renderFinance = () => (
     <div style={styles.layoutTwoCol}>
@@ -6050,6 +6508,12 @@ const printDocumentBase = ({
                 style={activeTab === "leads" ? styles.activeTabButton : styles.tabButton}
               >
                 Leads
+              </button>
+              <button
+                onClick={() => setActiveTab("team")}
+                style={activeTab === "team" ? styles.activeTabButton : styles.tabButton}
+              >
+                Team
               </button>
             </div>
 
